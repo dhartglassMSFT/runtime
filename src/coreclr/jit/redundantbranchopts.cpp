@@ -4,6 +4,240 @@
 #include "jitpch.h"
 
 //------------------------------------------------------------------------
+// optFoldCompareThroughPhi: fold a redundant materialized compare that is
+//    consumed only by its own branch and by a phi arg on the edge where the
+//    branch pins the compare's value to a constant.
+//
+// Arguments:
+//   block - block ending in a conditional branch to optimize
+//
+// Returns:
+//   True if a change was made.
+//
+// Notes:
+//   Recognizes the following pattern (in SSA form):
+//
+//       block:
+//          STORE_LCL_VAR V = relop(a, b)   // single def of V, in this block
+//          JTRUE(EQ/NE(V, 0))              // branch tests V against zero
+//
+//   where V's only uses are (1) the branch above and (2) a single phi arg on
+//   the edge out of `block` along which the branch pins V to the constant 0.
+//   Roslyn emits this shape for `o != null && (o is X ...)` and similar: the
+//   leading null check is materialized into the result local instead of having
+//   the branch test `o` directly. Because V is reassigned later (the pattern
+//   result is merged back through the phi), V is not single-def-single-use and
+//   ordinary forward substitution cannot remove the materialized compare, so it
+//   survives to codegen as e.g. `cmp; cset; cbz` instead of a single `cbz`.
+//
+//   On the pinned edge V is provably 0, and on the other edge V is dead (the
+//   precondition guarantees no other uses), so we can:
+//     - replace the def of V with the constant 0, and
+//     - sink the compare relop(a, b) into the branch (reversing its sense when
+//       the branch tested EQ(V, 0)), so the branch tests a/b directly.
+//
+//   This lets lowering branch on the original operands (e.g. `cbz x0`) rather
+//   than materializing the boolean. The fix is architecture-neutral, which is
+//   why the redundancy is observed on both arm64 and x64.
+//
+bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
+{
+    assert(block->KindIs(BBJ_COND));
+
+    Statement* const jumpStmt = block->lastStmt();
+    if (jumpStmt == nullptr)
+    {
+        return false;
+    }
+
+    GenTree* const jumpTree = jumpStmt->GetRootNode();
+    if (!jumpTree->OperIs(GT_JTRUE))
+    {
+        return false;
+    }
+
+    // Want: JTRUE(EQ/NE(lcl, 0)).
+    //
+    GenTree* const cond = jumpTree->AsOp()->gtGetOp1();
+    if (!cond->OperIs(GT_EQ, GT_NE))
+    {
+        return false;
+    }
+
+    GenTree* const condOp1 = cond->AsOp()->gtGetOp1();
+    GenTree* const condOp2 = cond->AsOp()->gtGetOp2();
+
+    if (!condOp1->OperIs(GT_LCL_VAR) || !condOp2->IsIntegralConst(0))
+    {
+        return false;
+    }
+
+    GenTreeLclVarCommon* const vNode  = condOp1->AsLclVarCommon();
+    unsigned const             lclNum = vNode->GetLclNum();
+    unsigned const             ssaNum = vNode->GetSsaNum();
+
+    if (ssaNum == SsaConfig::RESERVED_SSA_NUM)
+    {
+        return false;
+    }
+
+    LclVarDsc* const varDsc = lvaGetDesc(lclNum);
+
+    // Keep things simple: a non-address-exposed integer local.
+    //
+    if (varDsc->IsAddressExposed() || !varTypeIsIntegralOrI(varDsc->TypeGet()))
+    {
+        return false;
+    }
+
+    LclSsaVarDsc* const ssaDsc = varDsc->GetPerSsaData(ssaNum);
+
+    // The def must be a relop store in this block.
+    //
+    if (ssaDsc->GetBlock() != block)
+    {
+        return false;
+    }
+
+    GenTreeLclVarCommon* const defNode = ssaDsc->GetDefNode();
+    if ((defNode == nullptr) || !defNode->OperIs(GT_STORE_LCL_VAR))
+    {
+        return false;
+    }
+
+    GenTree* const compare = defNode->AsLclVar()->Data();
+    if (!compare->OperIsCompare() || ((compare->gtFlags & GTF_SIDE_EFFECT) != 0))
+    {
+        return false;
+    }
+
+    // Profitability: V's only uses must be the branch compare and a single phi
+    // arg on the pinned edge. GetNumUses() is an upper bound, so requiring
+    // exactly 2 (the branch use plus one phi-arg use) together with finding the
+    // pinned phi arg below proves there are no other uses.
+    //
+    if (!ssaDsc->HasPhiUse() || (ssaDsc->GetNumUses() != 2))
+    {
+        return false;
+    }
+
+    // Which successor edge pins V to 0?
+    //   JTRUE(EQ(V,0)) : V == 0 on the TRUE (jump) edge.
+    //   JTRUE(NE(V,0)) : V == 0 on the FALSE (fall-through) edge.
+    //
+    const bool        pinnedOnTrueEdge = cond->OperIs(GT_EQ);
+    BasicBlock* const pinnedSucc       = pinnedOnTrueEdge ? block->GetTrueTarget() : block->GetFalseTarget();
+
+    // Find the phi arg in pinnedSucc that consumes (lclNum, ssaNum) along the
+    // edge from block. With numUses == 2 this is V's only phi use.
+    //
+    GenTreePhiArg* pinnedPhiArg = nullptr;
+    for (Statement* const stmt : pinnedSucc->Statements())
+    {
+        if (!stmt->IsPhiDefnStmt())
+        {
+            break;
+        }
+
+        GenTreePhi* const phi = stmt->GetRootNode()->AsLclVar()->Data()->AsPhi();
+        for (GenTreePhi::Use& use : phi->Uses())
+        {
+            GenTreePhiArg* const phiArg = use.GetNode()->AsPhiArg();
+            if ((phiArg->GetLclNum() == lclNum) && (phiArg->GetSsaNum() == ssaNum) && (phiArg->gtPredBB == block))
+            {
+                pinnedPhiArg = phiArg;
+                break;
+            }
+        }
+
+        if (pinnedPhiArg != nullptr)
+        {
+            break;
+        }
+    }
+
+    if (pinnedPhiArg == nullptr)
+    {
+        // The phi use is on the other (non-pinned) edge, where V is not a known
+        // constant. Cannot fold.
+        //
+        return false;
+    }
+
+    // All preconditions satisfied. Perform the transform.
+    //
+    JITDUMP("\noptFoldCompareThroughPhi: V%02u.%u in " FMT_BB " is a materialized compare used only by its branch and "
+            "a phi arg pinned to 0 on the %s edge to " FMT_BB "; folding\n",
+            lclNum, ssaNum, block->bbNum, pinnedOnTrueEdge ? "true" : "false", pinnedSucc->bbNum);
+    DISPTREE(jumpTree);
+
+    // Find the statement that holds the def of V so we can re-sequence it after
+    // moving the compare out of it.
+    //
+    Statement* defStmt = nullptr;
+    for (Statement* const stmt : block->Statements())
+    {
+        if (stmt->GetRootNode() == defNode)
+        {
+            defStmt = stmt;
+            break;
+        }
+    }
+
+    if (defStmt == nullptr)
+    {
+        // Defensive: the def node is expected to be a statement root in block.
+        //
+        return false;
+    }
+
+    const ValueNum vnZero = vnStore->VNForIntCon(0);
+
+    // 1) Replace the def of V with the constant 0.
+    //
+    GenTree* const zero = gtNewIconNode(0, genActualType(varDsc->TypeGet()));
+    zero->gtVNPair.SetBoth(vnZero);
+    defNode->AsLclVar()->gtOp1 = zero;
+    ssaDsc->m_vnPair.SetBoth(vnZero);
+
+    // 2) Sink the compare into the branch, reversing its sense if the branch
+    //    tested EQ(V, 0) (i.e. "branch when the compare is false").
+    //
+    if (pinnedOnTrueEdge)
+    {
+        compare->SetOper(GenTree::ReverseRelop(compare->OperGet()));
+    }
+
+    // The compare is now consumed by the branch rather than producing a value,
+    // so mark it accordingly.
+    //
+    compare->gtFlags |= (GTF_RELOP_JMP_USED | GTF_DONT_CSE);
+
+    jumpTree->AsOp()->gtOp1 = compare;
+
+    // Clear the old side-effect bits (inherited from EQ(V,0) which had none) and
+    // recompute from the new child, which may have GTF_GLOB_REF / GTF_EXCEPT.
+    jumpTree->gtFlags &= ~GTF_ALL_EFFECT;
+    gtUpdateNodeSideEffects(jumpTree);
+
+    fgValueNumberTree(compare);
+
+    // 3) The pinned phi arg now reads the constant-0 def; keep its VN consistent.
+    //
+    pinnedPhiArg->gtVNPair.SetBoth(vnZero);
+
+    // 4) Re-thread the gtNext/gtPrev node lists of both edited statements, since
+    //    the compare subtree moved from the def statement into the jump statement.
+    //
+    gtSetStmtInfo(defStmt);
+    fgSetStmtSeq(defStmt);
+    gtSetStmtInfo(jumpStmt);
+    fgSetStmtSeq(jumpStmt);
+
+    return true;
+}
+
+//------------------------------------------------------------------------
 // optRedundantBranches: try and optimize redundant branches in the method
 //
 // Returns:
@@ -47,7 +281,8 @@ PhaseStatus Compiler::optRedundantBranches()
             //
             if (block->KindIs(BBJ_COND))
             {
-                bool madeChangesThisBlock = m_compiler->optRedundantRelop(block);
+                bool madeChangesThisBlock = m_compiler->optFoldCompareThroughPhi(block);
+                madeChangesThisBlock |= m_compiler->optRedundantRelop(block);
 
                 BasicBlock* const bbFalse = block->GetFalseTarget();
                 BasicBlock* const bbTrue  = block->GetTrueTarget();
