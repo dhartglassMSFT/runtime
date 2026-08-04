@@ -111,6 +111,15 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
         return false;
     }
 
+#ifdef TARGET_ARM64
+    // The JUMPs this transform considers become CBZ on arm64, so sinking a non-compare-against-zero
+    // there will undo a CBZ opportunity.
+    if (!compare->OperIs(GT_EQ, GT_NE) || !compare->gtGetOp2()->IsIntegralConst(0))
+    {
+        return false;
+    }
+#endif // TARGET_ARM64
+
     // Profitability: V's only uses must be the branch compare and a single phi
     // arg on the pinned edge. GetNumUses() is an upper bound, so requiring
     // exactly 2 (the branch use plus one phi-arg use) together with finding the
@@ -215,18 +224,22 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
 
     jumpTree->AsOp()->gtOp1 = compare;
 
-    // Clear the old side-effect bits (inherited from EQ(V,0) which had none) and
-    // recompute from the new child, which may have GTF_GLOB_REF / GTF_EXCEPT.
-    jumpTree->gtFlags &= ~GTF_ALL_EFFECT;
-    gtUpdateNodeSideEffects(jumpTree);
-
     fgValueNumberTree(compare);
 
     // 3) The pinned phi arg now reads the constant-0 def; keep its VN consistent.
     //
     pinnedPhiArg->gtVNPair.SetBoth(vnZero);
 
-    // 4) Re-thread the gtNext/gtPrev node lists of both edited statements, since
+    // 4) Recompute the side-effect flags of both edited statements. The def's store
+    //    now has a side-effect-free constant RHS, so any GTF_EXCEPT / GTF_ORDER_SIDEEFF
+    //    it inherited from the old compare's operands (e.g. a faulting indirection)
+    //    must be dropped -- otherwise fgDebugCheckFlags asserts "Extra flags on tree".
+    //    The jump now owns the sunk compare and takes on its effects.
+    //
+    gtUpdateStmtSideEffects(defStmt);
+    gtUpdateStmtSideEffects(jumpStmt);
+
+    // 5) Re-thread the gtNext/gtPrev node lists of both edited statements, since
     //    the compare subtree moved from the def statement into the jump statement.
     //
     gtSetStmtInfo(defStmt);
