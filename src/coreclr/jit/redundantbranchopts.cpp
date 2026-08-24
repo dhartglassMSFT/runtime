@@ -23,6 +23,9 @@
 //
 //   where V's only uses are (1) the branch above and (2) a single phi arg on
 //   the edge out of `block` along which the branch pins V to the constant 0.
+//   The two statements must also be adjacent: the transform sinks the compare
+//   into the branch, so anything executing in between could write what the
+//   compare reads.
 //   Roslyn emits this shape for `o != null && (o is X ...)` and similar: the
 //   leading null check is materialized into the result local instead of having
 //   the branch test `o` directly. Because V is reassigned later (the pattern
@@ -111,6 +114,35 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
         return false;
     }
 
+    // The transform sinks the compare from its defining statement into the branch
+    // at the end of the block, so nothing may execute in between: an intervening
+    // store, call, or other write to memory can change what the compare reads.
+    // The GTF_SIDE_EFFECT test above does not cover this -- it only rejects a
+    // compare that *causes* effects, while a plain GTF_GLOB_REF load (a static
+    // field, say) causes none yet is still sensitive to stores it would move past.
+    // SSA names protect the local operands, so memory is the exposure.
+    //
+    // Requiring the def to be the statement immediately preceding the jump makes
+    // the move trivially safe, and matches the shape Roslyn emits for the pattern
+    // this pass targets.
+    //
+    Statement* const defStmt = jumpStmt->GetPrevStmt();
+    if ((defStmt == nullptr) || (defStmt->GetRootNode() != defNode))
+    {
+        return false;
+    }
+
+    // The transform also reorders the def against the compare: V is overwritten
+    // with zero before the sunk compare runs, where before the compare ran first.
+    // SSA numbers distinguish versions but not storage -- every version of V
+    // shares one home -- so a compare reading any version of V would read the
+    // zero we just stored. `b = !b` produces exactly that shape.
+    //
+    if (gtHasRef(compare, lclNum))
+    {
+        return false;
+    }
+
 #ifdef TARGET_ARM64
     // The JUMPs this transform considers become CBZ on arm64, so sinking a non-compare-against-zero
     // there will undo a CBZ opportunity.
@@ -180,26 +212,6 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
             lclNum, ssaNum, block->bbNum, pinnedOnTrueEdge ? "true" : "false", pinnedSucc->bbNum);
     DISPTREE(jumpTree);
 
-    // Find the statement that holds the def of V so we can re-sequence it after
-    // moving the compare out of it.
-    //
-    Statement* defStmt = nullptr;
-    for (Statement* const stmt : block->Statements())
-    {
-        if (stmt->GetRootNode() == defNode)
-        {
-            defStmt = stmt;
-            break;
-        }
-    }
-
-    if (defStmt == nullptr)
-    {
-        // Defensive: the def node is expected to be a statement root in block.
-        //
-        return false;
-    }
-
     const ValueNum vnZero = vnStore->VNForIntCon(0);
 
     // 1) Replace the def of V with the constant 0.
@@ -210,11 +222,15 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
     ssaDsc->m_vnPair.SetBoth(vnZero);
 
     // 2) Sink the compare into the branch, reversing its sense if the branch
-    //    tested EQ(V, 0) (i.e. "branch when the compare is false").
+    //    tested EQ(V, 0) (i.e. "branch when the compare is false"). Use
+    //    gtTryReverseCond rather than a bare ReverseRelop: for floating point
+    //    the reversed relop must also flip GTF_RELOP_NAN_UN, since !(a ord b)
+    //    is (a unord b).
     //
     if (pinnedOnTrueEdge)
     {
-        compare->SetOper(GenTree::ReverseRelop(compare->OperGet()));
+        bool reversed = gtTryReverseCond(compare);
+        assert(reversed); // gtTryReverseCond always succeeds for OperIsCompare()
     }
 
     // The compare is now consumed by the branch rather than producing a value,
