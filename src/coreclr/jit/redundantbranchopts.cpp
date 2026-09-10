@@ -93,6 +93,18 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
         return false;
     }
 
+    // A field of a dependently promoted struct shares its home with the parent local,
+    // and a promoted local is never itself in SSA. A reference to the parent -- a
+    // whole-struct copy, or a LCL_FLD overlapping the field -- therefore reads and
+    // writes V's storage without being recorded as a use of any version of V. Both
+    // the use count checked below and the store of zero the transform emits assume
+    // V's storage is reachable only through V, so such a field is not eligible.
+    //
+    if (lvaIsFieldOfDependentlyPromotedStruct(varDsc))
+    {
+        return false;
+    }
+
     LclSsaVarDsc* const ssaDsc = varDsc->GetPerSsaData(ssaNum);
 
     // The def must be a relop store in this block.
