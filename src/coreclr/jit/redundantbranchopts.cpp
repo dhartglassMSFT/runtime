@@ -156,8 +156,10 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
     }
 
 #ifdef TARGET_ARM64
-    // The JUMPs this transform considers become CBZ on arm64, so sinking a non-compare-against-zero
-    // there will undo a CBZ opportunity.
+    // On arm64 a materialized bool is already cheap: cset + cbz needs no separate test. Sinking a
+    // compare against zero still wins (cmp #0 folds into cbz), but sinking a non-zero compare only
+    // swaps cset+cbz for mov+b.cond. That saves nothing and the extra zero-init often costs size.
+    // On xarch, the setcc+movzx+test sequence is removed, so sinking always pays.
     if (!compare->OperIs(GT_EQ, GT_NE) || !compare->gtGetOp2()->IsIntegralConst(0))
     {
         return false;
@@ -224,11 +226,12 @@ bool Compiler::optFoldCompareThroughPhi(BasicBlock* const block)
             lclNum, ssaNum, block->bbNum, pinnedOnTrueEdge ? "true" : "false", pinnedSucc->bbNum);
     DISPTREE(jumpTree);
 
-    const ValueNum vnZero = vnStore->VNForIntCon(0);
+    const var_types zeroType = genActualType(varDsc->TypeGet());
+    const ValueNum  vnZero   = vnStore->VNZeroForType(zeroType);
 
     // 1) Replace the def of V with the constant 0.
     //
-    GenTree* const zero = gtNewIconNode(0, genActualType(varDsc->TypeGet()));
+    GenTree* const zero = gtNewIconNode(0, zeroType);
     zero->gtVNPair.SetBoth(vnZero);
     defNode->AsLclVar()->gtOp1 = zero;
     ssaDsc->m_vnPair.SetBoth(vnZero);
