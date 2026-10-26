@@ -7384,6 +7384,12 @@ private:
 
     void fgMorphCallInline(GenTreeCall* call, InlineResult* result);
     void fgMorphCallInlineHelper(GenTreeCall* call, InlineResult* result, InlineContext** createdContext);
+
+    // Blocks that became unreachable during fgInline because of a branch fold. Only valid during fgInline.
+    BlkSet* m_inlineDeadBlocks = nullptr;
+    bool fgInlineIsDeadBlock(BasicBlock* block);
+    bool fgInlineHasOnlyDeadPreds(BasicBlock* block);
+    void fgInlineNoteDeadBlock(BasicBlock* block);
 #if DEBUG
     void fgNoteNonInlineCandidate(Statement* stmt, GenTreeCall* call);
 #endif

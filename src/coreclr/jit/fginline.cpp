@@ -845,8 +845,11 @@ private:
                     retainedEdge = block->GetTrueEdge();
                 }
 
+                BasicBlock* const removedTarget = removedEdge->getDestinationBlock();
                 m_compiler->fgRemoveRefPred(removedEdge);
                 block->SetKindAndTargetEdge(BBJ_ALWAYS, retainedEdge);
+
+                m_compiler->fgInlineNoteDeadBlock(removedTarget);
 
                 // Update profile, make it consistent if possible.
                 //
@@ -1080,6 +1083,21 @@ PhaseStatus Compiler::fgInline()
     madeChanges |= walker.MadeChanges();
 
 #ifdef DEBUG
+    if (m_inlineDeadBlocks != nullptr)
+    {
+        // Verify with a full DFS (which accounts for EH flow) that nothing recorded as dead is reachable.
+        FlowGraphDfsTree* const dfsTree = fgComputeDfs();
+
+        for (BasicBlock* const deadBlock : BlkSet::KeyIteration(m_inlineDeadBlocks))
+        {
+            assert(!dfsTree->Contains(deadBlock));
+        }
+    }
+#endif
+
+    m_inlineDeadBlocks = nullptr;
+
+#ifdef DEBUG
 
     // Check that we should not have any inline candidate or return value place holder left.
 
@@ -1119,6 +1137,101 @@ PhaseStatus Compiler::fgInline()
     Metrics.InlineAttempt = m_inlineStrategy->GetImportCount();
 
     return madeChanges ? PhaseStatus::MODIFIED_EVERYTHING : PhaseStatus::MODIFIED_NOTHING;
+}
+
+//------------------------------------------------------------------------------
+// fgInlineIsDeadBlock: check if a block has been found unreachable during fgInline
+//
+// Arguments:
+//    block - block to check
+//
+// Returns:
+//    true if an inliner branch fold left the block with no live predecessors
+//
+bool Compiler::fgInlineIsDeadBlock(BasicBlock* block)
+{
+    return (m_inlineDeadBlocks != nullptr) && m_inlineDeadBlocks->Lookup(block);
+}
+
+//------------------------------------------------------------------------------
+// fgInlineHasOnlyDeadPreds: check if all references to a block come from dead blocks
+//
+// Arguments:
+//    block - block to check
+//
+// Returns:
+//    true if every reference to the block is a pred edge from a dead block
+//
+// Notes:
+//    References that are not backed by pred edges (method entry, handler entries)
+//    keep the block alive.
+//
+bool Compiler::fgInlineHasOnlyDeadPreds(BasicBlock* block)
+{
+    if (block->HasFlag(BBF_DONT_REMOVE))
+    {
+        return false;
+    }
+
+    unsigned predRefs = 0;
+
+    for (FlowEdge* const predEdge : block->PredEdges())
+    {
+        if (!fgInlineIsDeadBlock(predEdge->getSourceBlock()))
+        {
+            return false;
+        }
+
+        predRefs += predEdge->getDupCount();
+    }
+
+    return predRefs == block->bbRefs;
+}
+
+//------------------------------------------------------------------------------
+// fgInlineNoteDeadBlock: record blocks made unreachable by an inliner branch fold
+//
+// Arguments:
+//    block - block that lost a predecessor edge to the fold
+//
+// Notes:
+//    The flow graph is left alone; unreachable block removal cleans up later.
+//    Blocks reachable only through dead blocks are also recorded. Cycles of
+//    dead blocks are not detected.
+//
+void Compiler::fgInlineNoteDeadBlock(BasicBlock* block)
+{
+    if (!fgInlineHasOnlyDeadPreds(block))
+    {
+        return;
+    }
+
+    if (m_inlineDeadBlocks == nullptr)
+    {
+        m_inlineDeadBlocks = new (getAllocator(CMK_Inlining)) BlkSet(getAllocator(CMK_Inlining));
+    }
+
+    ArrayStack<BasicBlock*> worklist(getAllocator(CMK_Inlining));
+    worklist.Push(block);
+
+    while (!worklist.Empty())
+    {
+        BasicBlock* const deadCandidate = worklist.Pop();
+
+        if (fgInlineIsDeadBlock(deadCandidate) || !fgInlineHasOnlyDeadPreds(deadCandidate))
+        {
+            continue;
+        }
+
+        JITDUMP(FMT_BB " is unreachable after inliner branch fold\n", deadCandidate->bbNum);
+        m_inlineDeadBlocks->Set(deadCandidate, true);
+        Metrics.InlinerDeadBlocks++;
+
+        deadCandidate->VisitRegularSuccs(this, [&](BasicBlock* succ) {
+            worklist.Push(succ);
+            return BasicBlockVisit::Continue;
+        });
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -1242,6 +1355,30 @@ void Compiler::fgMorphCallInlineHelper(GenTreeCall* call, InlineResult* result, 
 {
     // Don't expect any surprises here.
     assert(result->IsCandidate());
+
+    if (fgInlineIsDeadBlock(compCurBB))
+    {
+#ifdef DEBUG
+        bool stmtInBlock = false;
+
+        for (Statement* const stmt : compCurBB->Statements())
+        {
+            if (stmt == fgMorphStmt)
+            {
+                stmtInBlock = true;
+                break;
+            }
+        }
+
+        assert(stmtInBlock);
+#endif
+
+        JITDUMP("Not inlining [%06u]: " FMT_BB " became unreachable after an inliner branch fold\n", dspTreeID(call),
+                compCurBB->bbNum);
+        Metrics.InlinerDeadCallSitesSkipped++;
+        result->NoteFatal(InlineObservation::CALLSITE_IS_IN_DEAD_BLOCK);
+        return;
+    }
 
 #if defined(DEBUG)
     // Fail if we're inlining and we've reached the acceptance limit.

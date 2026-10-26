@@ -144,6 +144,7 @@ INLINE_OBSERVATION(GENERIC_DICTIONARY_LOOKUP, bool,   "runtime dictionary lookup
 INLINE_OBSERVATION(HAS_COMPLEX_HANDLE,        bool,   "complex handle access",                FATAL,       CALLSITE)
 INLINE_OBSERVATION(IMPLICIT_REC_TAIL_CALL,    bool,   "implicit recursive tail call",         FATAL,       CALLSITE)
 INLINE_OBSERVATION(IS_CALL_TO_HELPER,         bool,   "target is helper",                     FATAL,       CALLSITE)
+INLINE_OBSERVATION(IS_IN_DEAD_BLOCK,          bool,   "call site is in unreachable block",    FATAL,       CALLSITE)
 INLINE_OBSERVATION(IS_NOT_DIRECT,             bool,   "target not direct",                    FATAL,       CALLSITE)
 INLINE_OBSERVATION(IS_NOT_DIRECT_MANAGED,     bool,   "target not direct managed",            FATAL,       CALLSITE)
 INLINE_OBSERVATION(IS_RECURSIVE,              bool,   "recursive",                            FATAL,       CALLSITE)
